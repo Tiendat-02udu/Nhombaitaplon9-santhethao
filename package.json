@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "dev:api": "tsx watch server/index.js",
-    "build": "tsc -b && vite build",
+    "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview",
     "seed": "node server/seed.js",

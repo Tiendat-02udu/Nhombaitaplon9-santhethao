@@ -32,19 +32,25 @@ router.post('/', requireRole('player'), async (req, res, next) => {
     const venue = await Venue.findOne({ _id: venueId, isActive: true })
     if (!venue) return res.status(404).json({ error: 'Sân không tồn tại hoặc đã ngừng hoạt động.' })
     const requestedStart = Number(time.slice(0, 2)) * 60 + Number(time.slice(3, 5))
+    const requestedEnd = requestedStart + durationHours * 60
     const opening = Number(venue.openingTime.slice(0, 2)) * 60 + Number(venue.openingTime.slice(3, 5))
     const closing = Number(venue.closingTime.slice(0, 2)) * 60 + Number(venue.closingTime.slice(3, 5))
-    if (requestedStart < opening || requestedStart + durationHours * 60 > closing) {
+    if (requestedStart < opening || requestedEnd > closing) {
       return res.status(400).json({ error: 'Khung giờ nằm ngoài giờ hoạt động của sân.' })
     }
+
+    // Also check old booking records, which may predate the atomic reservation guard.
     const dayBookings = await Booking.find({ venue: venue.id, date, status: 'confirmed' }).select('time durationHours')
     const hasOverlap = dayBookings.some((existing) => {
       const existingStart = Number(existing.time.slice(0, 2)) * 60 + Number(existing.time.slice(3, 5))
       return requestedStart < existingStart + existing.durationHours * 60
-        && requestedStart + durationHours * 60 > existingStart
+        && requestedEnd > existingStart
     })
     if (hasOverlap) return res.status(409).json({ error: 'Khung giờ này vừa được đặt. Vui lòng chọn giờ khác.' })
-    const booking = await Booking.create({
+
+    // Updating the venue document atomically prevents simultaneous requests from
+    // reserving overlapping intervals, including intervals with different start times.
+    const booking = new Booking({
       venue: venue.id,
       customer: req.user.id,
       date,
@@ -52,6 +58,41 @@ router.post('/', requireRole('player'), async (req, res, next) => {
       durationHours,
       price: venue.pricePerHour * durationHours,
     })
+    const reservation = await Venue.findOneAndUpdate(
+      {
+        _id: venue.id,
+        isActive: true,
+        reservations: {
+          $not: {
+            $elemMatch: {
+              date,
+              startMinute: { $lt: requestedEnd },
+              endMinute: { $gt: requestedStart },
+            },
+          },
+        },
+      },
+      {
+        $push: {
+          reservations: {
+            booking: booking._id,
+            date,
+            startMinute: requestedStart,
+            endMinute: requestedEnd,
+          },
+        },
+      },
+      { new: true, projection: { _id: 1 } },
+    )
+    if (!reservation) return res.status(409).json({ error: 'Khung giờ này vừa được đặt. Vui lòng chọn giờ khác.' })
+
+    try {
+      await booking.save()
+    } catch (error) {
+      await Venue.updateOne({ _id: venue.id }, { $pull: { reservations: { booking: booking._id } } })
+      throw error
+    }
+
     await booking.populate('venue')
     res.status(201).json({ data: booking })
   } catch (error) {
@@ -71,6 +112,7 @@ router.patch('/:id/cancel', async (req, res, next) => {
     booking.status = 'cancelled'
     booking.cancelledAt = new Date()
     await booking.save()
+    await Venue.updateOne({ _id: booking.venue._id }, { $pull: { reservations: { booking: booking._id } } })
     res.status(200).json({ data: booking })
   } catch (error) {
     next(error)
